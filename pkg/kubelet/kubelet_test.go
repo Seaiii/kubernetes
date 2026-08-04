@@ -3116,6 +3116,109 @@ func TestSyncTerminatingPodKillPod(t *testing.T) {
 	checkPodStatus(t, kl, pod, v1.PodFailed)
 }
 
+func TestSyncPodCancellationDuringContainerSync(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
+	defer testKubelet.Cleanup()
+	kl := testKubelet.kubelet
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: "sync-pod", Name: "sync-pod", Namespace: "test"},
+		Spec:       v1.PodSpec{Containers: []v1.Container{{Name: "container", Image: "image"}}},
+	}
+	kl.podManager.SetPods([]*v1.Pod{pod})
+	podStatus := &kubecontainer.PodStatus{ID: pod.UID, Name: pod.Name, Namespace: pod.Namespace}
+
+	started := make(chan struct{}, 1)
+	testKubelet.fakeRuntime.Lock()
+	testKubelet.fakeRuntime.BlockSyncPod = true
+	testKubelet.fakeRuntime.SyncPodStarted = started
+	testKubelet.fakeRuntime.Unlock()
+
+	ctx, cancel := context.WithCancel(tCtx)
+	defer cancel()
+	var (
+		isTerminal bool
+		err        error
+	)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		isTerminal, _, err = kl.SyncPod(ctx, kubetypes.SyncPodCreate, pod, nil, podStatus)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SyncPod did not reach the blocking runtime call")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SyncPod did not return after its context was cancelled")
+	}
+	require.True(t, wait.Interrupted(err), "expected an interruption error, got %v", err)
+	assert.False(t, isTerminal, "a cancelled sync must not mark the pod terminal")
+}
+
+func TestSyncTerminatingPodCancellation(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
+	defer testKubelet.Cleanup()
+	kl := testKubelet.kubelet
+	recorder := record.NewFakeRecorder(10)
+	kl.recorder = recorder
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: "terminating-pod", Name: "terminating-pod", Namespace: "test"},
+		Spec:       v1.PodSpec{Containers: []v1.Container{{Name: "container", Image: "image"}}},
+	}
+	kl.podManager.SetPods([]*v1.Pod{pod})
+	podStatus := &kubecontainer.PodStatus{
+		ID:        pod.UID,
+		Name:      pod.Name,
+		Namespace: pod.Namespace,
+		ContainerStatuses: []*kubecontainer.Status{{
+			ID:    kubecontainer.ContainerID{Type: "test", ID: "container"},
+			Name:  "container",
+			State: kubecontainer.ContainerStateRunning,
+		}},
+	}
+
+	started := make(chan struct{}, 1)
+	testKubelet.fakeRuntime.Lock()
+	testKubelet.fakeRuntime.BlockKillPod = true
+	testKubelet.fakeRuntime.KillPodStarted = started
+	testKubelet.fakeRuntime.Unlock()
+
+	ctx, cancel := context.WithCancel(tCtx)
+	defer cancel()
+	var err error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		gracePeriod := int64(30)
+		err = kl.SyncTerminatingPod(ctx, pod, podStatus, &gracePeriod, nil)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SyncTerminatingPod did not reach the blocking runtime call")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SyncTerminatingPod did not return after its context was cancelled")
+	}
+	require.True(t, wait.Interrupted(err), "expected an interruption error, got %v", err)
+	select {
+	case event := <-recorder.Events:
+		t.Fatalf("deliberate cancellation was reported as a warning event: %s", event)
+	default:
+	}
+}
+
 func TestPullErrorReportsMissingSecrets(t *testing.T) {
 	tCtx := ktesting.Init(t)
 

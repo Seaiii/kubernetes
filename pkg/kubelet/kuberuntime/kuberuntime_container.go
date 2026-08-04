@@ -753,9 +753,10 @@ func (m *kubeGenericRuntimeManager) toKubeContainerStatus(ctx context.Context, p
 		StopSignal:          cStatusStopSignal,
 	}
 
-	if status.State != runtimeapi.ContainerState_CONTAINER_CREATED {
+	if status.State != runtimeapi.ContainerState_CONTAINER_CREATED && status.StartedAt != 0 {
 		// If container is not in the created state, we have tried and
-		// started the container. Set the StartedAt time.
+		// started the container. A cancelled start may report an exited
+		// container with no start timestamp, which must remain unset.
 		cStatus.StartedAt = time.Unix(0, status.StartedAt)
 	}
 	if status.State == runtimeapi.ContainerState_CONTAINER_EXITED {
@@ -801,6 +802,11 @@ func (m *kubeGenericRuntimeManager) executePreStopHook(ctx context.Context, pod 
 	select {
 	case <-time.After(time.Duration(gracePeriod) * time.Second):
 		logger.V(2).Info("PreStop hook not completed in grace period", "pod", klog.KObj(pod), "podUID", pod.UID,
+			"containerName", containerSpec.Name, "containerID", containerID.String(), "gracePeriod", gracePeriod)
+	case <-ctx.Done():
+		// A shorter deletion grace period supersedes this hook invocation. The
+		// queued pod worker update will retry termination with the new deadline.
+		logger.V(2).Info("PreStop hook interrupted", "pod", klog.KObj(pod), "podUID", pod.UID,
 			"containerName", containerSpec.Name, "containerID", containerID.String(), "gracePeriod", gracePeriod)
 	case <-done:
 		logger.V(3).Info("PreStop hook completed", "pod", klog.KObj(pod), "podUID", pod.UID,
